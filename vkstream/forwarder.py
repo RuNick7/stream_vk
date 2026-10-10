@@ -23,11 +23,12 @@ import aiohttp
 from .config import Config
 from .render import Rendered, esc, message_url, render_message
 from .sender import TransientSendError
-from .state import ALLOW, ASK, BLOCK, PENDING, Chat, State
+from .state import ALLOW, ASK, BLOCK, CHANNEL, PENDING, Chat, State
 from .vk.channels import channel_history, list_channels
 from .vk.client import VKAuthError, VKClient, VKError
 from .vk.longpoll import LongPoll, LongPollExpired, LongPollUnavailable, is_noise, peers_in_update
 from .vk.peers import Names, PeerInfo, list_conversations
+from .vk.wall import NotACommunity, parse_link, post_url, resolve_community, wall_key, wall_owner, wall_posts
 
 log = logging.getLogger(__name__)
 
@@ -40,6 +41,8 @@ TRANSIENT_VK_CODES = {-1, 1, 6, 9, 10, 14, 29}
 
 # Источники списка чатов; у каждого своя отметка «прочитан целиком» в State.baselined
 CONVERSATIONS, REQUESTS, CHANNELS = "conversations", "requests", "channels"
+# Стена сообщества, добавленная по ссылке: в списках ВК её нет, Chat.api == WALL
+WALL = "wall"
 
 
 class Sink(Protocol):
@@ -58,6 +61,7 @@ class Forwarder:
     SWEEP_PAGE = 50
     MAX_CONVERSATIONS = 20_000
     NEW_CHAT_BACKLOG = 10  # сколько непрочитанных пересылать из чата, которого раньше не было
+    WALL_PAGE = 10  # сколько последних записей стены запрашивать за раз
 
     def __init__(self, cfg: Config, state: State, vk: VKClient, sink: Sink):
         self.cfg = cfg
@@ -76,6 +80,7 @@ class Forwarder:
         self.read_errors: dict[str, str | None] = {}
         self._feature_retry_at: dict[str, float] = {}
         self._last_full_sweep: float | None = None
+        self._wall_polled_at: dict[int, float] = {}
         self._dirty = False
         self._authed = asyncio.Event()
         self._need_auth = asyncio.Event()
@@ -107,6 +112,25 @@ class Forwarder:
             # текущее последнее сообщение. Список чатов мог устареть: события по
             # неинтересным чатам сверку не будят, — поэтому читаем историю сразу.
             self.trigger(peer_id, force=True)
+        return chat
+
+    async def add_wall(self, link: str) -> Chat:
+        """Подписаться на стену сообщества по ссылке; пересылаться будут новые записи."""
+        screen_name = parse_link(link, bare_names=True)
+        if screen_name is None:
+            raise NotACommunity(link)
+        community = await resolve_community(self.vk, screen_name)
+        owner_id = -community.id
+        # Заодно убеждаемся, что стена нам вообще открыта
+        posts = await wall_posts(self.vk, self.names, owner_id, self.WALL_PAGE)
+        newest = max((post["conversation_message_id"] for post in posts), default=0)
+        key = wall_key(owner_id)
+        chat = self.state.chats.setdefault(key, Chat(key, community.name, CHANNEL, api=WALL))
+        chat.title, chat.decision, chat.asked = community.name, ALLOW, False
+        chat.last_cmid = chat.head_cmid = newest
+        chat.last_date = int(time.time())  # только что добавленное — наверху списка
+        self._wall_polled_at[key] = time.monotonic()
+        self.state.save()
         return chat
 
     def toggle(self, peer_id: int) -> Chat | None:
@@ -252,7 +276,14 @@ class Forwarder:
         # В очередь идут все чаты с непрочитанным ботом хвостом, а не только
         # замеченные сейчас: так повторяется и то, что не удалось переслать раньше.
         for chat in self.state.chats.values():
-            if chat.has_news and chat.policy in (ALLOW, ASK):
+            if chat.api == WALL:
+                # У стен списка нет: читаем саму стену, когда подошёл срок
+                polled_at = self._wall_polled_at.get(chat.peer_id)
+                due = polled_at is None or now - polled_at >= self.cfg.wall_poll_interval
+                if chat.policy == ALLOW and due:
+                    self._wall_polled_at[chat.peer_id] = now
+                    self.trigger(chat.peer_id, force=True)
+            elif chat.has_news and chat.policy in (ALLOW, ASK):
                 self.trigger(chat.peer_id)
 
     async def _sweep_conversations(self) -> None:
@@ -383,7 +414,9 @@ class Forwarder:
             self.state.save()
 
     async def _history(self, chat: Chat, count: int, fresh: bool) -> list[dict]:
-        if chat.api == CHANNELS:
+        if chat.api == WALL:
+            items = await wall_posts(self.vk, self.names, wall_owner(chat.peer_id), count)
+        elif chat.api == CHANNELS:
             # fresh: номер последнего поста из списка мог устареть — пусть узнают заново
             head = None if fresh else chat.head_cmid
             items = await channel_history(self.vk, self.names, chat.peer_id, head, count)
@@ -398,7 +431,7 @@ class Forwarder:
         chat = self.state.chats.get(peer_id)
         if chat is None or chat.policy not in (ALLOW, ASK) or not (chat.has_news or force):
             return
-        count = self.cfg.history_count
+        count = self.WALL_PAGE if chat.api == WALL else self.cfg.history_count
         history = await self._history(chat, count, fresh=force)
         items = [m for m in history if isinstance(m.get("conversation_message_id"), int)]
         newest = max((m["conversation_message_id"] for m in items), default=0)
@@ -414,8 +447,9 @@ class Forwarder:
         )
         if not new:
             # Список обещал новое, а в истории его нет (удалили): не ходим по кругу
-            self._skip_to_head(chat)
-            self.state.save()
+            if chat.has_news:
+                self._skip_to_head(chat)
+                self.state.save()
             return
 
         if chat.policy == ASK:
@@ -445,9 +479,14 @@ class Forwarder:
 
     async def _forward(self, chat: Chat, msg: dict) -> None:
         rendered = render_message(msg, title=chat.title, kind=chat.kind, names=self.names)
-        url = None
-        if chat.api != CHANNELS:  # адрес поста канала в веб-версии нам неизвестен
-            url = message_url(self.cfg.vk_origin, chat.peer_id, msg["conversation_message_id"])
+        cmid = msg["conversation_message_id"]
+        if chat.api == WALL:
+            url = post_url(self.cfg.vk_origin, wall_owner(chat.peer_id), cmid)
+        elif chat.api == CHANNELS:
+            url = None  # адрес поста канала в веб-версии нам неизвестен
+        else:
+            url = message_url(self.cfg.vk_origin, chat.peer_id, cmid)
         await self.sink.send(rendered, url=url)
+        chat.last_date = max(chat.last_date, int(msg.get("date") or 0))
         self.forwarded += 1
         self.last_forward_at = time.time()

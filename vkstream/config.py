@@ -20,6 +20,8 @@ class Config:
     # Интервал сверки с ВК, пока long poll работает, и пока он недоступен
     poll_interval: float = 60.0
     fallback_poll_interval: float = 8.0
+    # Как часто проверять стены сообществ, добавленных по ссылке
+    wall_poll_interval: float = 300.0
     # Сколько последних сообщений чата запрашивать за раз (максимум VK — 200)
     history_count: int = 50
     log_level: str = "INFO"
@@ -65,6 +67,7 @@ def load_config(env_file: str | Path | None = None) -> Config:
         fallback_poll_interval=float(
             _str("FALLBACK_POLL_INTERVAL") or defaults.fallback_poll_interval
         ),
+        wall_poll_interval=float(_str("WALL_POLL_INTERVAL") or defaults.wall_poll_interval),
         history_count=min(200, int(_str("HISTORY_COUNT") or defaults.history_count)),
         log_level=_str("LOG_LEVEL", defaults.log_level).upper(),
         vk_origin=_str("VK_ORIGIN", defaults.vk_origin).rstrip("/"),

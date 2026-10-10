@@ -99,3 +99,23 @@ async def test_check_names_what_vk_refused(cfg, fake_vk: FakeVK, capsys):
     assert "[!!] ВК: long poll недоступен, бот будет работать опросом" in out
     assert "[!!] ВК: папка «Запросы» недоступна" in out
     assert "[!!] ВК: каналы недоступны: [3] channels.get: Unknown method passed" in out
+
+
+async def test_check_reports_added_walls(cfg, fake_vk: FakeVK, capsys):
+    from vkstream.state import ALLOW, CHANNEL, Chat
+    from vkstream.vk.wall import wall_key
+
+    fake_vk.add_community()
+    fake_vk.add_community(130, "Закрытый клуб", "closed_club")
+    fake_vk.communities[130]["closed"] = True
+    fake_vk.add_wall_post("запись")
+    state = State(cfg.state_path)
+    for group_id, title in ((129, "Лекции"), (130, "Закрытый клуб")):
+        key = wall_key(-group_id)
+        state.chats[key] = Chat(key, title, CHANNEL, api="wall", decision=ALLOW)
+    state.save()
+
+    await main_module.check(cfg)
+    out = capsys.readouterr().out
+    assert "[ok] ВК: стена «Лекции» читается, записей получено: 1" in out
+    assert "[!!] ВК: стена «Закрытый клуб» не читается: [15]" in out

@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import secrets
 import time
 from dataclasses import dataclass, field
 
+import aiohttp
 from aiogram import F, Router
 from aiogram.enums import ChatType
 from aiogram.exceptions import TelegramBadRequest
@@ -23,7 +25,8 @@ from .config import Config
 from .forwarder import CHANNELS, CONVERSATIONS, LOGIN_HINT, REQUESTS, Forwarder
 from .render import KIND_ICONS, esc
 from .state import ALLOW, BLOCK, BUSINESS, CHANNEL, GROUP, PERSONAL, Chat, State
-from .vk.client import VKClient
+from .vk.client import VKAuthError, VKClient, VKError
+from .vk.wall import NotACommunity, parse_link
 
 PAGE_SIZE = 8
 SEARCH_LIMIT = 10
@@ -39,14 +42,19 @@ KIND_RULES = {
 KIND_LEGEND = {
     PERSONAL: "✅ пересылается · 🚫 заблокирован",
     GROUP: "✅ пересылается · 🚫 заблокирована · ❓ спрошу при первом сообщении",
-    CHANNEL: "✅ пересылается · 🚫 заблокирован · ❓ спрошу при первом посте",
+    CHANNEL: "✅ пересылается · 🚫 заблокирован · ❓ спрошу при первом посте\n"
+    "Сообщество со стеной добавляется ссылкой: /add",
     BUSINESS: "✅ пересылается · 🚫 не пересылается",
 }
 # Порядок разделов на экране настроек
 KIND_ORDER = (GROUP, CHANNEL, PERSONAL, BUSINESS)
 
+# Коды VK API «нет доступа»: закрытая группа, приватная стена, вас заблокировали
+ACCESS_DENIED_CODES = {15, 18, 30, 203}
+
 COMMANDS = [
     BotCommand(command="settings", description="Что пересылать: разделы и чаты"),
+    BotCommand(command="add", description="Добавить сообщество по ссылке"),
     BotCommand(command="find", description="Найти чат по названию"),
     BotCommand(command="status", description="Состояние подключения к ВК"),
     BotCommand(command="help", description="Справка"),
@@ -59,6 +67,8 @@ HELP = (
     "спрошу, оставить или заблокировать;\n"
     "🏢 <b>бизнес и реклама</b> (диалоги с сообществами) — не пересылаю.\n\n"
     "/settings — изменить выбор для любого чата\n"
+    "/add <i>ссылка</i> — пересылать новые записи со стены сообщества "
+    "(или просто пришлите ссылку вида vk.ru/club1)\n"
     "/find <i>текст</i> — найти чат по названию (или просто напишите название)\n"
     "/status — состояние подключения к ВК"
 )
@@ -274,8 +284,47 @@ async def cmd_find(message: Message, command: CommandObject, app: App) -> None:
     await _search(message, app, query)
 
 
+async def cmd_add(message: Message, command: CommandObject, app: App) -> None:
+    link = (command.args or "").strip()
+    if not link:
+        await message.answer("Пришлите ссылку на сообщество: <code>/add https://vk.ru/club1</code>")
+        return
+    await _add_wall(message, app, link)
+
+
 async def on_text(message: Message, app: App) -> None:
-    await _search(message, app, (message.text or "").strip())
+    text = (message.text or "").strip()
+    if parse_link(text):  # ссылка на сообщество — добавляем, всё остальное — поиск
+        await _add_wall(message, app, text)
+    else:
+        await _search(message, app, text)
+
+
+async def _add_wall(message: Message, app: App, link: str) -> None:
+    try:
+        chat = await app.forwarder.add_wall(link)
+    except NotACommunity:
+        text = (
+            "Это не похоже на сообщество ВК. Нужна ссылка на группу или паблик, "
+            "например <code>https://vk.ru/club1</code>."
+        )
+    except VKAuthError as e:
+        text = f"⚠️ ВК не подключён: {esc(e.message)}.\n{LOGIN_HINT}"
+    except VKError as e:
+        if e.code in ACCESS_DENIED_CODES:
+            text = "⚠️ Стена этого сообщества закрыта для вашего аккаунта ВК."
+        else:
+            text = f"⚠️ Ошибка VK API: {esc(e)}"
+    except (aiohttp.ClientError, asyncio.TimeoutError):
+        text = "⚠️ Нет связи с ВК, попробуйте ещё раз."
+    else:
+        minutes = max(1, round(app.cfg.wall_poll_interval / 60))
+        text = (
+            f"✅ 📣 <b>{esc(chat.title)}</b> добавлено.\n"
+            f"Новые записи со стены будут приходить сюда (проверяю раз в {minutes} мин).\n"
+            "Отключить: /settings → Каналы."
+        )
+    await message.answer(text)
 
 
 async def _search(message: Message, app: App, query: str) -> None:
@@ -348,6 +397,7 @@ def build_router() -> Router:
     owner.message.register(cmd_status, Command("status"))
     owner.message.register(cmd_settings, Command("settings"))
     owner.message.register(cmd_find, Command("find"))
+    owner.message.register(cmd_add, Command("add"))
     owner.message.register(on_text, F.text & ~F.text.startswith("/"))
     owner.callback_query.register(cb_main, F.data == "m")
     owner.callback_query.register(cb_category, F.data.startswith("c:"))

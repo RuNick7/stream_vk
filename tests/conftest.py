@@ -27,6 +27,7 @@ CHAT = 2_000_000_001  # беседа («группа»)
 USER = 42  # личный диалог
 SHOP = -7  # диалог с сообществом («бизнес»)
 CHANNEL_ID = -500  # канал мессенджера
+GROUP_ID = 129  # сообщество со стеной (владелец стены — минус этот id)
 
 
 class FakeVK:
@@ -48,6 +49,8 @@ class FakeVK:
         self.history_errors: dict[int, int] = {}  # peer_id -> код ошибки messages.getHistory
         self.channels: dict[int, dict] = {}  # channel_id -> {"title", "posts"}
         self.history_skips_start = False  # channels.getHistory отдаёт только посты старше start_cmid
+        # сообщества: id -> {"name", "screen_name", "closed", "posts"}
+        self.communities: dict[int, dict] = {}
         self._clock = 0
         self.lp_updates: asyncio.Queue = asyncio.Queue()
         self.lp_requests: list[str] = []
@@ -80,6 +83,22 @@ class FakeVK:
     def _touch(self, peer_id: int) -> None:
         self._clock += 1
         self.activity[peer_id] = self._clock
+
+    def add_community(self, group_id: int = GROUP_ID, name: str = "Лекции", screen_name: str = "lectures") -> None:
+        self.communities[group_id] = {"name": name, "screen_name": screen_name, "closed": False, "posts": []}
+
+    def add_wall_post(self, text: str, group_id: int = GROUP_ID, **extra) -> dict:
+        posts = self.communities[group_id]["posts"]
+        post = {
+            "id": len(posts) + 1,
+            "owner_id": -group_id,
+            "from_id": -group_id,
+            "date": int(time.time()),
+            "text": text,
+            **extra,
+        }
+        posts.append(post)
+        return post
 
     def add_channel(self, channel_id: int = CHANNEL_ID, title: str = "Новости канала") -> None:
         self.channels[channel_id] = {"title": title, "posts": []}
@@ -208,6 +227,30 @@ class FakeVK:
             "conversations": [self._conversation(peer_id)],
             **self._extended(),
         }
+
+    def m_utils_resolveScreenName(self, form) -> dict | list:
+        name = form["screen_name"]
+        if name == "durov":
+            return {"type": "user", "object_id": 1}
+        for group_id, community in self.communities.items():
+            if community["screen_name"] == name:
+                return {"type": "group", "object_id": group_id}
+        return []  # так ВК отвечает на несуществующее имя
+
+    def m_groups_getById(self, form) -> dict | web.Response:
+        community = self.communities.get(int(form["group_id"]))
+        if community is None:
+            return _error(100, "One of the parameters specified was missing or invalid: group_id is invalid")
+        return {"groups": [{"id": int(form["group_id"]), "name": community["name"]}], "profiles": []}
+
+    def m_wall_get(self, form) -> dict | web.Response:
+        community = self.communities[-int(form["owner_id"])]
+        if community["closed"]:
+            return _error(15, "Access denied: group is blocked or closed")
+        posts = list(reversed(community["posts"]))
+        # закреплённая запись всегда идёт первой, даже если она старая
+        posts.sort(key=lambda p: not p.get("is_pinned"))
+        return {"count": len(posts), "items": posts[: int(form.get("count", 20))], **self._extended()}
 
     def _channel_item(self, channel_id: int) -> dict:
         channel = self.channels[channel_id]

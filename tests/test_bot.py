@@ -250,3 +250,57 @@ async def test_status_text(harness: Harness):
     del app.state.chats[CHANNEL_ID]
     edit, _ = await harness.press("c:channel:0")
     assert "ВК не отдал список каналов" in edit.text
+
+
+# --- добавление сообщества по ссылке ------------------------------------------
+
+
+async def test_add_community_by_command_and_by_plain_link(harness: Harness, fake_vk):
+    app = harness.app
+    fake_vk.add_community()
+    fake_vk.add_community(130, "Конспекты", "notes")
+    fake_vk.add_wall_post("уже было")
+
+    (reply,) = await harness.say("/add https://vk.ru/club129")
+    assert "✅ 📣 <b>Лекции</b> добавлено." in reply.text and "раз в 5 мин" in reply.text
+    (reply,) = await harness.say("https://vk.ru/notes")  # ссылку можно прислать и без команды
+    assert "<b>Конспекты</b> добавлено" in reply.text
+    (reply,) = await harness.say("/add lectures")  # повторное добавление ничего не ломает
+    assert "<b>Лекции</b> добавлено" in reply.text
+
+    walls = [c for c in app.state.chats.values() if c.api == "wall"]
+    assert sorted((c.title, c.kind, c.policy) for c in walls) == [
+        ("Конспекты", CHANNEL, ALLOW),
+        ("Лекции", CHANNEL, ALLOW),
+    ]
+    edit, _ = await harness.press("c:channel:0")
+    titles = [text for text, _ in buttons(edit)]
+    assert "✅ Лекции" in titles and "✅ Конспекты" in titles and "/add" in edit.text
+
+
+async def test_add_explains_what_went_wrong(harness: Harness, fake_vk):
+    fake_vk.add_community()
+    (reply,) = await harness.say("/add")
+    assert "Пришлите ссылку" in reply.text
+    (reply,) = await harness.say("/add https://vk.ru/durov")
+    assert "не похоже на сообщество" in reply.text
+    (reply,) = await harness.say("https://vk.ru/no_such_page")
+    assert "не похоже на сообщество" in reply.text
+
+    fake_vk.communities[129]["closed"] = True
+    (reply,) = await harness.say("/add club129")
+    assert "закрыта для вашего аккаунта" in reply.text
+
+    harness.app.cfg.session_path.unlink()
+    harness.app.vk.token = None
+    harness.app.vk.cookies = type(harness.app.vk.cookies)()
+    (reply,) = await harness.say("/add club129")
+    assert "ВК не подключён" in reply.text and "python -m vkstream login" in reply.text
+    assert all(c.api != "wall" for c in harness.app.state.chats.values())
+
+
+async def test_plain_words_still_search_not_add(harness: Harness, fake_vk):
+    fake_vk.add_community(screen_name="soseди")
+    (reply,) = await harness.say("Соседи")
+    assert buttons(reply) == [("❓ 👥 Соседи", f"f:{CHAT2}")]
+    assert "utils.resolveScreenName" not in fake_vk.calls

@@ -2,5 +2,3 @@ aiogram>=3.31,<4
 aiohttp>=3.14
 aiohttp-socks>=0.12
 python-dotenv>=1.2
-# нужен только для `python -m vkstream login` (использует установленный Chrome)
-playwright>=1.63

@@ -1,33 +1,62 @@
-"""Подключение аккаунта ВК: вход в браузере или импорт cookie.
+"""Подключение аккаунта ВК: вход в окне браузера или импорт cookie.
 
 Пароль программа не видит и не хранит: вы входите на vk.ru сами, а на диск
 сохраняются только cookie сессии (data/vk_session.json, права 0600).
+
+Браузер запускается как обычный Chrome, без флагов автоматизации, с пустым
+временным профилем. Программа только читает из него cookie через DevTools.
 """
 
 from __future__ import annotations
 
 import asyncio
 import getpass
+import json
+import os
 import shutil
+import socket
+import subprocess
 import tempfile
+
+import aiohttp
 
 from .config import Config
 from .vk.client import VKAuthError, VKClient
 from .vk.cookies import CookieStore
 
-LOGIN_TIMEOUT = 600
+LOGIN_TIMEOUT = 600  # сколько ждать, пока вы войдёте
+STARTUP_TIMEOUT = 30  # сколько ждать запуска браузера
+POLL_INTERVAL = 2.0
+
+MAC_BROWSERS = (
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "/Applications/Chromium.app/Contents/MacOS/Chromium",
+    "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+    "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+)
+LINUX_BROWSERS = (
+    "google-chrome",
+    "google-chrome-stable",
+    "chromium",
+    "chromium-browser",
+    "microsoft-edge",
+    "brave-browser",
+)
+WINDOWS_BROWSERS = (
+    ("Google", "Chrome", "Application", "chrome.exe"),
+    ("Microsoft", "Edge", "Application", "msedge.exe"),
+)
 
 
-async def login(cfg: Config, from_cookie: bool = False) -> None:
+async def login(cfg: Config, from_cookie: bool = False, headless: bool = False) -> None:
     vk = VKClient(cfg)
-    if from_cookie:
-        vk.cookies = _ask_cookies()
-    else:
-        browser_cookies, vk.user_agent = await _browser_login(cfg)
-        vk.cookies = CookieStore.from_browser(browser_cookies)
     try:
+        if from_cookie:
+            vk.adopt(_ask_cookies())
+            await vk.refresh_token(force=True)
+        else:
+            await _browser_login(cfg, vk, headless)
         # Проверяем сессию тем же путём, каким потом будет ходить бот
-        await vk.refresh_token(force=True)
         users = await vk.call("users.get")
     except VKAuthError as e:
         raise SystemExit(f"ВК не принял сессию: {e.message}. Попробуйте войти ещё раз.") from None
@@ -50,82 +79,120 @@ def _ask_cookies() -> CookieStore:
     return cookies
 
 
-async def _browser_login(cfg: Config, headless: bool = False) -> tuple[list[dict], str]:
-    """Открыть vk.ru в браузере и дождаться входа. -> (cookie браузера, User-Agent)."""
-    try:
-        from playwright.async_api import Error as PlaywrightError
-        from playwright.async_api import async_playwright
-    except ImportError:
-        raise SystemExit(
-            "Не установлен playwright: pip install playwright\n"
-            "Либо войдите через cookie: python -m vkstream login --cookie"
-        ) from None
+def find_browser() -> str | None:
+    """Путь к Chrome или другому браузеру на Chromium; VKSTREAM_BROWSER задаёт его явно."""
+    override = os.getenv("VKSTREAM_BROWSER")
+    if override:
+        return override
+    candidates = list(MAC_BROWSERS)
+    candidates += [path for path in map(shutil.which, LINUX_BROWSERS) if path]
+    for root in filter(None, map(os.getenv, ("PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA"))):
+        candidates += [os.path.join(root, *parts) for parts in WINDOWS_BROWSERS]
+    return next((path for path in candidates if os.path.exists(path)), None)
 
+
+async def _browser_login(cfg: Config, vk: VKClient, headless: bool = False) -> None:
+    """Открыть vk.ru в окне браузера и дождаться, пока вход даст рабочую сессию."""
+    binary = find_browser()
+    if binary is None:
+        raise SystemExit(
+            "Не нашёл Google Chrome. Установите его, укажите путь к браузеру в переменной\n"
+            "VKSTREAM_BROWSER или войдите через cookie: python -m vkstream login --cookie"
+        )
     # Профиль временный: после входа от него нужны только cookie
     profile = tempfile.mkdtemp(prefix="vkstream-login-")
+    port = _free_port()
+    args = [
+        binary,
+        f"--remote-debugging-port={port}",
+        f"--user-data-dir={profile}",
+        "--no-first-run",
+        "--no-default-browser-check",
+    ]
+    if headless:
+        args.append("--headless=new")
+    proc = subprocess.Popen([*args, cfg.vk_origin + "/im"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    devtools = f"http://127.0.0.1:{port}"
+    # Свой HTTP-клиент для DevTools: у клиента ВК может быть настроен прокси
+    local = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None))
     try:
-        async with async_playwright() as pw:
-            context = None
-            for channel in ("chrome", "msedge", None):  # None — Chromium самого Playwright
-                try:
-                    context = await pw.chromium.launch_persistent_context(
-                        profile,
-                        channel=channel,
-                        headless=headless,
-                        no_viewport=True,
-                        args=["--disable-blink-features=AutomationControlled"],
-                        ignore_default_args=["--enable-automation"],
-                    )
-                    break
-                except PlaywrightError:
-                    continue
-            if context is None:
-                raise SystemExit(
-                    "Не нашёл браузер. Установите Google Chrome или выполните: playwright install chromium"
-                )
-            page = context.pages[0] if context.pages else await context.new_page()
-            await page.goto(cfg.vk_origin + "/im", wait_until="domcontentloaded")
-            print("Войдите в свой аккаунт ВК в открывшемся окне — оно закроется само.")
-
-            loop = asyncio.get_running_loop()
-            deadline = loop.time() + LOGIN_TIMEOUT
+        info = await _wait_for_browser(local, devtools, proc)
+        user_agent = str(info.get("User-Agent") or "").replace("HeadlessChrome", "Chrome")
+        print("Войдите в свой аккаунт ВК в открывшемся окне — оно закроется само.")
+        print("Если страница долго не открывается, обновите её: программа подождёт.")
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + LOGIN_TIMEOUT
+        async with local.ws_connect(info["webSocketDebuggerUrl"], max_msg_size=0) as ws:
             while loop.time() < deadline:
-                await asyncio.sleep(2)
+                await asyncio.sleep(POLL_INTERVAL)
+                if proc.poll() is not None or not await _has_open_tabs(local, devtools):
+                    raise SystemExit("Окно браузера закрыто до завершения входа.")
+                found = await _devtools(ws, "Storage.getCookies")
+                cookies = CookieStore.from_browser(found.get("cookies") or [])
+                if not cookies.get("remixsid"):
+                    continue
+                vk.adopt(cookies, user_agent or None)
                 try:
-                    cookies = await context.cookies()
-                    if not any(c["name"] == "remixsid" and c["value"] for c in cookies):
-                        continue
-                    if not await _has_web_token(context, cfg):
-                        continue
-                    user_agent = await page.evaluate("navigator.userAgent")
-                    cookies = await context.cookies()
-                except PlaywrightError:
-                    if not context.pages:
-                        raise SystemExit("Окно браузера закрыто до завершения входа.") from None
-                    continue  # страница перезагружалась в момент проверки
-                await context.close()
-                return cookies, user_agent
-            await context.close()
-            raise SystemExit("Вход не выполнен за отведённое время.")
+                    await vk.refresh_token(force=True)
+                except (VKAuthError, aiohttp.ClientError, asyncio.TimeoutError):
+                    continue  # вход ещё не завершён (или ВК ответил не сразу)
+                return
+        raise SystemExit("Вход не выполнен за отведённое время.")
+    except (aiohttp.ClientError, ConnectionError):
+        raise SystemExit("Окно браузера закрыто до завершения входа.") from None
     finally:
+        await local.close()
+        _stop(proc)
         shutil.rmtree(profile, ignore_errors=True)
 
 
-async def _has_web_token(context, cfg: Config) -> bool:
-    """Выдаёт ли VK этой сессии токен веб-клиента, то есть завершён ли вход."""
-    resp = await context.request.post(
-        f"{cfg.vk_login_base}/?act=web_token",
-        form={"version": "1", "app_id": cfg.vk_app_id},
-        headers={"Origin": cfg.vk_origin, "Referer": cfg.vk_origin + "/"},
-    )
-    try:
-        payload = await resp.json()
-    except ValueError:
-        return False
-    info = payload.get("data") if isinstance(payload, dict) else None
-    return (
-        isinstance(info, dict)
-        and payload.get("type") == "okay"
-        and bool(info.get("access_token"))
-        and int(info.get("user_id") or 0) > 0
-    )
+def _free_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+async def _wait_for_browser(http: aiohttp.ClientSession, devtools: str, proc: subprocess.Popen) -> dict:
+    """Дождаться, пока браузер поднимет DevTools. -> его /json/version."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + STARTUP_TIMEOUT
+    while loop.time() < deadline:
+        if proc.poll() is not None:
+            raise SystemExit("Браузер закрылся сразу после запуска. Попробуйте ещё раз или войдите через --cookie.")
+        try:
+            async with http.get(devtools + "/json/version", timeout=aiohttp.ClientTimeout(total=2)) as resp:
+                info = await resp.json(content_type=None)
+            if isinstance(info, dict) and info.get("webSocketDebuggerUrl"):
+                return info
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+            pass
+        await asyncio.sleep(0.3)
+    raise SystemExit("Браузер не запустился. Попробуйте ещё раз или войдите через --cookie.")
+
+
+async def _has_open_tabs(http: aiohttp.ClientSession, devtools: str) -> bool:
+    # На macOS браузер живёт и после закрытия последнего окна — смотрим на вкладки
+    async with http.get(devtools + "/json/list", timeout=aiohttp.ClientTimeout(total=5)) as resp:
+        tabs = await resp.json(content_type=None)
+    return any(isinstance(tab, dict) and tab.get("type") == "page" for tab in tabs)
+
+
+async def _devtools(ws: aiohttp.ClientWebSocketResponse, method: str) -> dict:
+    """Одна команда DevTools Protocol и её результат."""
+    await ws.send_json({"id": 1, "method": method})
+    async for message in ws:
+        if message.type != aiohttp.WSMsgType.TEXT:
+            break
+        data = json.loads(message.data)
+        if data.get("id") == 1:  # остальное — события браузера, они нам не нужны
+            return data.get("result") or {}
+    raise ConnectionError("браузер закрыл соединение DevTools")
+
+
+def _stop(proc: subprocess.Popen) -> None:
+    if proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()

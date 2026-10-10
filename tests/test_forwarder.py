@@ -9,9 +9,12 @@ from dataclasses import replace
 from vkstream.forwarder import CHANNELS, CONVERSATIONS, REQUESTS, Forwarder
 from vkstream.sender import TransientSendError
 from vkstream.state import ALLOW, ASK, BLOCK, BUSINESS, CHANNEL, GROUP, PENDING, PERSONAL, State
-from vkstream.vk.client import VKClient
+import pytest
 
-from .conftest import CHANNEL_ID, CHAT, SHOP, USER, FakeSink, FakeVK, wait_until, write_session
+from vkstream.vk.client import VKClient, VKError
+from vkstream.vk.wall import NotACommunity, wall_key
+
+from .conftest import CHANNEL_ID, CHAT, GROUP_ID, SHOP, USER, FakeSink, FakeVK, wait_until, write_session
 
 STRANGER = 43
 
@@ -430,3 +433,101 @@ async def test_telegram_outage_delays_but_does_not_lose_or_duplicate(cfg, fake_v
         await wait_until(lambda: len(sink.sent) == 2)
         await asyncio.sleep(0.2)
         assert sink.bodies == ["первое", "второе"]
+
+
+# --- стены сообществ, добавленные по ссылке -----------------------------------
+
+
+def wall_cfg(cfg):
+    return replace(cfg, poll_interval=0.05, wall_poll_interval=0.05)
+
+
+async def test_added_community_forwards_only_new_wall_posts(cfg, fake_vk: FakeVK):
+    seed(fake_vk)
+    fake_vk.add_community()
+    fake_vk.add_wall_post("старая запись")
+    fake_vk.add_wall_post("закреплённая", is_pinned=1)
+    async with running(wall_cfg(cfg)) as (fwd, sink):
+        chat = await fwd.add_wall(f"https://vk.ru/club{GROUP_ID}")
+        assert (chat.title, chat.kind, chat.policy, chat.last_cmid) == ("Лекции", CHANNEL, ALLOW, 2)
+        await asyncio.sleep(0.2)
+        assert sink.sent == [] and sink.asked == []  # ни старых записей, ни вопросов: вы сами её добавили
+
+        fake_vk.add_wall_post("новая запись")
+        await wait_until(lambda: sink.sent)
+        await asyncio.sleep(0.2)
+        assert sink.texts == ["📣 <b>Лекции</b>\nновая запись"]  # закреплённая не приходит повторно
+        assert sink.urls == [f"{fake_vk.base}/wall-{GROUP_ID}_3"]
+    assert State.load(cfg.state_path).chats[wall_key(-GROUP_ID)].last_cmid == 3
+
+
+async def test_wall_is_polled_on_its_own_schedule(cfg, fake_vk: FakeVK):
+    seed(fake_vk)
+    fake_vk.add_community()
+    async with running(replace(cfg, poll_interval=0.02, wall_poll_interval=30.0)) as (fwd, sink):
+        await fwd.add_wall("lectures")
+        fake_vk.calls.clear()
+        fake_vk.add_wall_post("подождёт своей очереди")
+        await wait_until(lambda: fake_vk.calls.count("messages.getConversations") >= 5)
+        assert "wall.get" not in fake_vk.calls and sink.sent == []
+
+
+async def test_posts_published_while_bot_was_down_arrive_after_restart(cfg, fake_vk: FakeVK):
+    seed(fake_vk)
+    fake_vk.add_community()
+    async with running(wall_cfg(cfg)) as (fwd, sink):
+        await fwd.add_wall(f"club{GROUP_ID}")
+    fake_vk.add_wall_post("раз")
+    fake_vk.add_wall_post("два")
+    async with running(wall_cfg(cfg)) as (fwd, sink):
+        await wait_until(lambda: len(sink.sent) == 2)
+        assert sink.bodies == ["раз", "два"]
+
+
+async def test_disabled_wall_is_not_read_and_resumes_from_new_posts(cfg, fake_vk: FakeVK):
+    seed(fake_vk)
+    fake_vk.add_community()
+    async with running(wall_cfg(cfg)) as (fwd, sink):
+        chat = await fwd.add_wall(f"club{GROUP_ID}")
+        fwd.decide(chat.peer_id, BLOCK)
+        fake_vk.calls.clear()
+        fake_vk.add_wall_post("пока отключено")
+        await asyncio.sleep(0.3)
+        assert "wall.get" not in fake_vk.calls and sink.sent == []
+
+        fwd.toggle(chat.peer_id)
+        await wait_until(lambda: chat.last_cmid == 1)
+        fake_vk.add_wall_post("после включения")
+        await wait_until(lambda: sink.sent)
+        assert sink.bodies == ["после включения"]
+
+
+async def test_wall_and_dialog_with_same_community_are_independent(cfg, fake_vk: FakeVK):
+    seed(fake_vk)
+    fake_vk.add_community()
+    fake_vk.add_message(-GROUP_ID, "рассылка от сообщества", from_id=-GROUP_ID)
+    async with running(wall_cfg(cfg)) as (fwd, sink):
+        wall = await fwd.add_wall(f"club{GROUP_ID}")
+        dialog = fwd.state.chats[-GROUP_ID]
+        assert (dialog.kind, dialog.policy, wall.policy) == (BUSINESS, BLOCK, ALLOW) and wall.peer_id != dialog.peer_id
+
+        say(fake_vk, -GROUP_ID, "ещё рассылка", from_id=-GROUP_ID)
+        fake_vk.add_wall_post("запись на стене")
+        await wait_until(lambda: sink.sent)
+        await asyncio.sleep(0.2)
+        assert sink.bodies == ["запись на стене"]  # сообщения сообщества по-прежнему не пересылаются
+
+
+async def test_closed_wall_is_refused_on_add(cfg, fake_vk: FakeVK):
+    seed(fake_vk)
+    fake_vk.add_community()
+    fake_vk.communities[GROUP_ID]["closed"] = True
+    async with running(cfg) as (fwd, sink):
+        with pytest.raises(VKError) as info:
+            await fwd.add_wall(f"club{GROUP_ID}")
+        assert info.value.code == 15
+        with pytest.raises(NotACommunity):
+            await fwd.add_wall("https://vk.ru/durov")
+        with pytest.raises(NotACommunity):
+            await fwd.add_wall("просто текст")
+        assert all(chat.api != "wall" for chat in fwd.state.chats.values())

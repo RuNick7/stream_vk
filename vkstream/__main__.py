@@ -84,6 +84,7 @@ async def check(cfg: Config) -> None:
             except LongPollUnavailable as e:
                 print(f"[!!] ВК: long poll недоступен, бот будет работать опросом. Причина: {e}")
             await _check_extras(vk)
+            await _check_walls(cfg, vk)
         except VKAuthError as e:
             print(f"[!!] ВК не подключён: {e.message}. Выполните: python -m vkstream login")
         except VKError as e:
@@ -134,6 +135,25 @@ async def _check_extras(vk) -> None:
         raise
     except VKError as e:
         print(f"[!!] ВК: каналы недоступны: {e}")
+
+
+async def _check_walls(cfg: Config, vk) -> None:
+    """Читаются ли стены сообществ, добавленных командой /add."""
+    from .state import State
+    from .vk.client import VKAuthError, VKError
+    from .vk.peers import Names
+    from .vk.wall import wall_owner, wall_posts
+
+    for chat in State.load(cfg.state_path).chats.values():
+        if chat.api != "wall":
+            continue
+        try:
+            posts = await wall_posts(vk, Names(), wall_owner(chat.peer_id), 1)
+            print(f"[ok] ВК: стена «{chat.title}» читается, записей получено: {len(posts)}")
+        except VKAuthError:
+            raise
+        except VKError as e:
+            print(f"[!!] ВК: стена «{chat.title}» не читается: {e}")
 
 
 def main() -> None:

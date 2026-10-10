@@ -111,6 +111,17 @@ class VKClient:
             raise VKAuthError("файл сессии ВК повреждён") from None
         self.user_agent = data.get("user_agent") or DEFAULT_USER_AGENT
 
+    def adopt(self, cookies: CookieStore, user_agent: str | None = None) -> None:
+        """Взять сессию не с диска (её только что получил login), забыв сохранённую."""
+        self.cookies = cookies
+        self.user_agent = user_agent or self.user_agent
+        self.token = None
+        try:
+            # иначе первый же запрос перечитал бы с диска прежнюю сессию
+            self._session_mtime = self.cfg.session_path.stat().st_mtime
+        except FileNotFoundError:
+            self._session_mtime = None
+
     def save_session(self) -> None:
         path = self.cfg.session_path
         write_private_json(
