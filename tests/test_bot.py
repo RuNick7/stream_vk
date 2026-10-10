@@ -263,6 +263,7 @@ async def test_add_community_by_command_and_by_plain_link(harness: Harness, fake
 
     (reply,) = await harness.say("/add https://vk.ru/club129")
     assert "✅ 📣 <b>Лекции</b> добавлено." in reply.text and "раз в 5 мин" in reply.text
+    assert "groups.getById" not in fake_vk.calls  # хватило одного чтения стены
     (reply,) = await harness.say("https://vk.ru/notes")  # ссылку можно прислать и без команды
     assert "<b>Конспекты</b> добавлено" in reply.text
     (reply,) = await harness.say("/add lectures")  # повторное добавление ничего не ломает
@@ -283,13 +284,15 @@ async def test_add_explains_what_went_wrong(harness: Harness, fake_vk):
     (reply,) = await harness.say("/add")
     assert "Пришлите ссылку" in reply.text
     (reply,) = await harness.say("/add https://vk.ru/durov")
-    assert "не похоже на сообщество" in reply.text
+    assert "не похоже на сообщество ВК (это user)" in reply.text
     (reply,) = await harness.say("https://vk.ru/no_such_page")
-    assert "не похоже на сообщество" in reply.text
+    assert "не похоже на сообщество ВК (такой страницы нет)" in reply.text
+    (reply,) = await harness.say("/add club999")  # ответ ВК виден дословно
+    assert "ВК не дал прочитать стену" in reply.text and "[100] wall.get:" in reply.text
 
     fake_vk.communities[129]["closed"] = True
     (reply,) = await harness.say("/add club129")
-    assert "закрыта для вашего аккаунта" in reply.text
+    assert "закрыта для вашего аккаунта" in reply.text and "[15] wall.get: Access denied" in reply.text
 
     harness.app.cfg.session_path.unlink()
     harness.app.vk.token = None

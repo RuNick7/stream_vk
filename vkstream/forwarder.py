@@ -28,7 +28,16 @@ from .vk.channels import channel_history, list_channels
 from .vk.client import VKAuthError, VKClient, VKError
 from .vk.longpoll import LongPoll, LongPollExpired, LongPollUnavailable, is_noise, peers_in_update
 from .vk.peers import Names, PeerInfo, list_conversations
-from .vk.wall import NotACommunity, parse_link, post_url, resolve_community, wall_key, wall_owner, wall_posts
+from .vk.wall import (
+    NotACommunity,
+    community_name,
+    parse_link,
+    post_url,
+    resolve_community_id,
+    wall_key,
+    wall_owner,
+    wall_posts,
+)
 
 log = logging.getLogger(__name__)
 
@@ -119,14 +128,16 @@ class Forwarder:
         screen_name = parse_link(link, bare_names=True)
         if screen_name is None:
             raise NotACommunity(link)
-        community = await resolve_community(self.vk, screen_name)
-        owner_id = -community.id
-        # Заодно убеждаемся, что стена нам вообще открыта
+        group_id = await resolve_community_id(self.vk, screen_name)
+        owner_id = -group_id
+        # Читаем стену сразу: так и проверяем, что она нам открыта, и узнаём,
+        # с какой записи начинать
         posts = await wall_posts(self.vk, self.names, owner_id, self.WALL_PAGE)
         newest = max((post["conversation_message_id"] for post in posts), default=0)
+        title = await community_name(self.vk, self.names, group_id)
         key = wall_key(owner_id)
-        chat = self.state.chats.setdefault(key, Chat(key, community.name, CHANNEL, api=WALL))
-        chat.title, chat.decision, chat.asked = community.name, ALLOW, False
+        chat = self.state.chats.setdefault(key, Chat(key, title, CHANNEL, api=WALL))
+        chat.title, chat.decision, chat.asked = title, ALLOW, False
         chat.last_cmid = chat.head_cmid = newest
         chat.last_date = int(time.time())  # только что добавленное — наверху списка
         self._wall_polled_at[key] = time.monotonic()

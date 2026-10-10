@@ -303,18 +303,20 @@ async def on_text(message: Message, app: App) -> None:
 async def _add_wall(message: Message, app: App, link: str) -> None:
     try:
         chat = await app.forwarder.add_wall(link)
-    except NotACommunity:
+    except NotACommunity as e:
+        detail = f" ({esc(e.detail)})" if e.detail else ""
         text = (
-            "Это не похоже на сообщество ВК. Нужна ссылка на группу или паблик, "
+            f"Это не похоже на сообщество ВК{detail}. Нужна ссылка на группу или паблик, "
             "например <code>https://vk.ru/club1</code>."
         )
     except VKAuthError as e:
         text = f"⚠️ ВК не подключён: {esc(e.message)}.\n{LOGIN_HINT}"
     except VKError as e:
+        # Ответ ВК показываем дословно: по нему видно, что именно не так
         if e.code in ACCESS_DENIED_CODES:
-            text = "⚠️ Стена этого сообщества закрыта для вашего аккаунта ВК."
+            text = f"⚠️ Стена этого сообщества закрыта для вашего аккаунта ВК.\n<i>{esc(e)}</i>"
         else:
-            text = f"⚠️ Ошибка VK API: {esc(e)}"
+            text = f"⚠️ ВК не дал прочитать стену этого сообщества.\n<i>{esc(e)}</i>"
     except (aiohttp.ClientError, asyncio.TimeoutError):
         text = "⚠️ Нет связи с ВК, попробуйте ещё раз."
     else:

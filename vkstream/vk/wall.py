@@ -8,9 +8,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
-
-from .client import VKClient, VKError
+from .client import VKAuthError, VKClient, VKError
 from .peers import Names
 
 # Ключи записей о стенах в State.chats. У стены сообщества тот же id, что и у
@@ -55,36 +53,40 @@ def parse_link(text: str, bare_names: bool = False) -> str | None:
     return name if _NAME.match(name) else None
 
 
-@dataclass(frozen=True)
-class Community:
-    id: int  # положительный id сообщества; владелец стены — минус этот id
-    name: str
-
-
 class NotACommunity(Exception):
     """Ссылка ведёт не на сообщество (на человека, приложение) или никуда."""
 
+    def __init__(self, link: str, detail: str = ""):
+        super().__init__(link)
+        self.detail = detail  # что именно ответил ВК — для сообщения пользователю
 
-async def resolve_community(vk: VKClient, screen_name: str) -> Community:
+
+async def resolve_community_id(vk: VKClient, screen_name: str) -> int:
+    """Положительный id сообщества по короткому имени (владелец стены — минус этот id)."""
     numeric = _NUMERIC.match(screen_name)
     if numeric:
-        group_id = int(numeric.group(1))
-    else:
-        resolved = await vk.call("utils.resolveScreenName", screen_name=screen_name)
-        if not isinstance(resolved, dict) or resolved.get("type") not in COMMUNITY_TYPES:
-            raise NotACommunity(screen_name)
-        group_id = int(resolved["object_id"])
+        return int(numeric.group(1))
+    resolved = await vk.call("utils.resolveScreenName", screen_name=screen_name)
+    kind = resolved.get("type") if isinstance(resolved, dict) else None
+    if kind not in COMMUNITY_TYPES or not resolved.get("object_id"):
+        raise NotACommunity(screen_name, f"это {kind}" if kind else "такой страницы нет")
+    return int(resolved["object_id"])
+
+
+async def community_name(vk: VKClient, names: Names, group_id: int) -> str:
+    """Название сообщества. Обычно оно уже пришло вместе со стеной (extended=1)."""
+    known = names.find(-group_id)
+    if known:
+        return known
     try:
-        resp = await vk.call("groups.getById", group_id=group_id)
-    except VKError as e:
-        if e.code == 100:  # «неверный параметр» — такого сообщества нет
-            raise NotACommunity(screen_name) from None
+        # именно group_ids: так метод вызывает сам vk.ru
+        resp = await vk.call("groups.getById", group_ids=group_id)
+        groups = resp.get("groups") if isinstance(resp, dict) else resp
+        return str(groups[0]["name"])
+    except VKAuthError:
         raise
-    # до версии API 5.139 метод отдавал просто список сообществ
-    groups = resp.get("groups") if isinstance(resp, dict) else resp
-    if not groups or not groups[0].get("id") or groups[0].get("deactivated"):
-        raise NotACommunity(screen_name)
-    return Community(int(groups[0]["id"]), groups[0].get("name") or screen_name)
+    except (VKError, LookupError, TypeError, AttributeError):
+        return f"Сообщество {group_id}"  # без названия жить можно, без стены — нет
 
 
 async def wall_posts(vk: VKClient, names: Names, owner_id: int, count: int) -> list[dict]:

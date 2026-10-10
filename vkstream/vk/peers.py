@@ -28,6 +28,10 @@ class Names:
             if g.get("name"):
                 self._names[-g["id"]] = g["name"]
 
+    def find(self, peer_id: int) -> str | None:
+        """Имя, если оно известно (get подставил бы заглушку вида club123)."""
+        return self._names.get(peer_id)
+
     def get(self, peer_id: int | None) -> str:
         if not peer_id:
             return "?"

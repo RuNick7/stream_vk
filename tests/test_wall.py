@@ -8,12 +8,12 @@ from vkstream.render import render_message
 from vkstream.vk.client import VKClient
 from vkstream.vk.peers import Names
 from vkstream.vk.wall import (
-    Community,
     NotACommunity,
+    community_name,
     normalize_wall_post,
     parse_link,
     post_url,
-    resolve_community,
+    resolve_community_id,
     wall_key,
     wall_owner,
     wall_posts,
@@ -61,21 +61,43 @@ def test_wall_keys_never_collide_with_chat_ids():
     assert post_url("https://vk.ru", -GROUP_ID, 7) == "https://vk.ru/wall-129_7"
 
 
-async def test_community_is_found_by_id_and_by_name(vk: VKClient, fake_vk: FakeVK):
+async def test_community_id_comes_from_link_number_or_screen_name(vk: VKClient, fake_vk: FakeVK):
     fake_vk.add_community()
-    assert await resolve_community(vk, f"club{GROUP_ID}") == Community(GROUP_ID, "Лекции")
-    assert await resolve_community(vk, f"public{GROUP_ID}") == Community(GROUP_ID, "Лекции")
-    assert await resolve_community(vk, "lectures") == Community(GROUP_ID, "Лекции")
-    assert "utils.resolveScreenName" not in fake_vk.calls[:2]  # по номеру имя выяснять не нужно
+    assert await resolve_community_id(vk, f"club{GROUP_ID}") == GROUP_ID
+    assert await resolve_community_id(vk, f"public{GROUP_ID}") == GROUP_ID
+    assert fake_vk.calls == []  # номер уже есть в ссылке — в ВК ходить незачем
+    assert await resolve_community_id(vk, "lectures") == GROUP_ID
 
 
-@pytest.mark.parametrize("name", ["durov", "no_such_page", "club999"])
-async def test_people_and_missing_pages_are_not_communities(vk: VKClient, fake_vk: FakeVK, name):
+@pytest.mark.parametrize(("name", "detail"), [("durov", "это user"), ("no_such_page", "такой страницы нет")])
+async def test_people_and_missing_pages_are_not_communities(vk: VKClient, fake_vk: FakeVK, name, detail):
     fake_vk.add_community()
     # у человека durov id 1 — и сообщество с тем же номером существует; путать их нельзя
     fake_vk.add_community(1, "Сообщество №1", "club_one")
-    with pytest.raises(NotACommunity):
-        await resolve_community(vk, name)
+    with pytest.raises(NotACommunity) as info:
+        await resolve_community_id(vk, name)
+    assert info.value.detail == detail
+
+
+async def test_community_name_comes_with_the_wall(vk: VKClient, fake_vk: FakeVK):
+    fake_vk.add_community()
+    names = Names()
+    await wall_posts(vk, names, -GROUP_ID, 5)
+    fake_vk.calls.clear()
+    assert await community_name(vk, names, GROUP_ID) == "Лекции"
+    assert fake_vk.calls == []  # отдельный запрос за названием не понадобился
+
+
+async def test_community_name_falls_back_to_lookup_then_to_placeholder(vk: VKClient, fake_vk: FakeVK):
+    fake_vk.add_community()
+    fake_vk.wall_names_owner = False
+    names = Names()
+    await wall_posts(vk, names, -GROUP_ID, 5)
+    assert await community_name(vk, names, GROUP_ID) == "Лекции"
+    assert fake_vk.calls[-1] == "groups.getById"
+
+    fake_vk.disabled.add("groups.getById")  # название — не повод отказывать в подписке
+    assert await community_name(vk, Names(), GROUP_ID) == f"Сообщество {GROUP_ID}"
 
 
 async def test_wall_posts_become_messages_with_repost_as_forward(vk: VKClient, fake_vk: FakeVK):

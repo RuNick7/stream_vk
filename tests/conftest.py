@@ -51,6 +51,7 @@ class FakeVK:
         self.history_skips_start = False  # channels.getHistory отдаёт только посты старше start_cmid
         # сообщества: id -> {"name", "screen_name", "closed", "posts"}
         self.communities: dict[int, dict] = {}
+        self.wall_names_owner = True  # wall.get возвращает название сообщества-владельца
         self._clock = 0
         self.lp_updates: asyncio.Queue = asyncio.Queue()
         self.lp_requests: list[str] = []
@@ -238,19 +239,28 @@ class FakeVK:
         return []  # так ВК отвечает на несуществующее имя
 
     def m_groups_getById(self, form) -> dict | web.Response:
-        community = self.communities.get(int(form["group_id"]))
-        if community is None:
-            return _error(100, "One of the parameters specified was missing or invalid: group_id is invalid")
-        return {"groups": [{"id": int(form["group_id"]), "name": community["name"]}], "profiles": []}
+        # сам vk.ru передаёт group_ids; единственное число ВК за параметр не считает
+        if "group_ids" not in form:
+            return _error(100, "One of the parameters specified was missing or invalid: group_ids is undefined")
+        ids = [int(g) for g in str(form["group_ids"]).split(",")]
+        if any(g not in self.communities for g in ids):
+            return _error(100, "One of the parameters specified was missing or invalid: group_ids is invalid")
+        return {"groups": [{"id": g, "name": self.communities[g]["name"]} for g in ids], "profiles": []}
 
     def m_wall_get(self, form) -> dict | web.Response:
-        community = self.communities[-int(form["owner_id"])]
+        group_id = -int(form["owner_id"])
+        community = self.communities.get(group_id)
+        if community is None:
+            return _error(100, "One of the parameters specified was missing or invalid: owner_id is incorrect")
         if community["closed"]:
             return _error(15, "Access denied: group is blocked or closed")
         posts = list(reversed(community["posts"]))
         # закреплённая запись всегда идёт первой, даже если она старая
         posts.sort(key=lambda p: not p.get("is_pinned"))
-        return {"count": len(posts), "items": posts[: int(form.get("count", 20))], **self._extended()}
+        extended = self._extended()
+        if self.wall_names_owner:  # с extended=1 ВК присылает и само сообщество
+            extended["groups"] = [*extended["groups"], {"id": group_id, "name": community["name"]}]
+        return {"count": len(posts), "items": posts[: int(form.get("count", 20))], **extended}
 
     def _channel_item(self, channel_id: int) -> dict:
         channel = self.channels[channel_id]
