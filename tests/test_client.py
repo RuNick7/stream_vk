@@ -50,10 +50,14 @@ async def test_api_errors_carry_code_and_method(vk: VKClient, fake_vk: FakeVK):
 
 
 async def test_lists_and_bools_are_encoded_for_vk(vk: VKClient, fake_vk: FakeVK):
-    fake_vk.history[5] = []
-    fake_vk.history[6] = []
-    resp = await vk.call("messages.getConversationsById", peer_ids=[5, 6], extended=True, skipped=None)
-    assert [c["peer"]["id"] for c in resp["items"]] == [5, 6]
+    fake_vk.add_channel(-5, "А")
+    fake_vk.add_channel(-6, "Б")
+    seen = {}
+    original = fake_vk.m_channels_getById
+    fake_vk.m_channels_getById = lambda form: seen.update(form) or original(form)
+    resp = await vk.call("channels.getById", channel_ids=[-5, -6], extended=True, skipped=None)
+    assert [item["channel"]["channel_id"] for item in resp["items"]] == [-5, -6]
+    assert (seen["channel_ids"], seen["extended"], "skipped" in seen) == ("-5,-6", "1", False)
 
 
 async def test_download_sends_session_only_to_vk_hosts(vk: VKClient, fake_vk: FakeVK):

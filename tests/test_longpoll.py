@@ -1,4 +1,4 @@
-from vkstream.vk.longpoll import peers_in_update
+from vkstream.vk.longpoll import is_noise, peers_in_update
 
 CHAT = 2_000_000_001
 WATCHED = {CHAT, 42, -7}
@@ -29,3 +29,10 @@ def test_garbage_is_ignored():
     assert peers_in_update("ping", WATCHED) == set()
     assert peers_in_update([], WATCHED) == set()
     assert peers_in_update([4, True, None, "42"], {1, 42}) == set()
+
+
+def test_noise_is_told_apart_from_unknown_events():
+    assert is_noise([63, CHAT, [42]]) and is_noise([10007, 1, 2]) and is_noise("ping") and is_noise([])
+    # незнакомый чат или неизвестный код — не шум: из-за такого события стоит свериться с ВК
+    assert not is_noise([10004, 1, 0, 5, 987654, 1790000000, "текст"])
+    assert not is_noise([99999, {"что-то": "новое"}])

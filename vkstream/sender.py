@@ -23,8 +23,8 @@ from aiogram.types import (
     LinkPreviewOptions,
 )
 
-from .render import MAX_UPLOAD_BYTES, Media, Rendered, esc, strip_tags
-from .state import State
+from .render import KIND_ICONS, MAX_UPLOAD_BYTES, Media, Rendered, esc, strip_tags
+from .state import ALLOW, BLOCK, CHANNEL, Chat, State
 from .vk.client import VKClient
 
 log = logging.getLogger(__name__)
@@ -51,6 +51,29 @@ class TelegramSink:
         """Служебное сообщение владельцу."""
         if self.state.owner_id is not None:
             await self._send_text(self.state.owner_id, text, None)
+
+    async def ask(self, chat: Chat) -> None:
+        """Спросить владельца, пересылать ли чат; ответ обрабатывает бот (callback `d:`)."""
+        if self.state.owner_id is None:
+            return
+        source = "этого канала" if chat.kind == CHANNEL else "этой группы"
+        text = (
+            f"❓ {KIND_ICONS.get(chat.kind, '')} <b>{esc(chat.title)}</b>\n"
+            f"Пересылать сюда сообщения из {source}? Пока не ответите, новые придержу."
+        )
+        markup = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="✅ Оставить", callback_data=f"d:{chat.peer_id}:{ALLOW}"),
+                    InlineKeyboardButton(text="🚫 Заблокировать", callback_data=f"d:{chat.peer_id}:{BLOCK}"),
+                ]
+            ]
+        )
+        try:
+            await self._call(lambda: self.bot.send_message(self.state.owner_id, text, reply_markup=markup))
+        except TelegramAPIError as e:
+            # Повтор не поможет; выбор всё равно можно сделать в /settings
+            log.error("Telegram отклонил вопрос о чате: %s", e)
 
     async def send(self, rendered: Rendered, url: str | None = None) -> None:
         chat_id = self.state.owner_id

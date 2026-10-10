@@ -23,8 +23,10 @@ from vkstream.render import Rendered
 from vkstream.state import write_private_json
 from vkstream.vk import client as client_module
 
-CHAT = 2_000_000_001
-USER = 42
+CHAT = 2_000_000_001  # беседа («группа»)
+USER = 42  # личный диалог
+SHOP = -7  # диалог с сообществом («бизнес»)
+CHANNEL_ID = -500  # канал мессенджера
 
 
 class FakeVK:
@@ -38,6 +40,15 @@ class FakeVK:
         self.disabled: set[str] = set()
         self.history: dict[int, list[dict]] = {}
         self.titles: dict[int, str] = {CHAT: "Рабочий чат"}
+        self.old_channels: set[int] = set()  # беседы-каналы старого образца (is_group_channel)
+        self.requests: set[int] = set()  # диалоги из папки «Запросы»
+        self.refused_filters: set[str] = set()  # значения filter, которые ВК «не понимает»
+        self.activity: dict[int, int] = {}  # порядок в списке: кто писал последним — тот выше
+        self.unread: dict[int, int] = {}
+        self.history_errors: dict[int, int] = {}  # peer_id -> код ошибки messages.getHistory
+        self.channels: dict[int, dict] = {}  # channel_id -> {"title", "posts"}
+        self.history_skips_start = False  # channels.getHistory отдаёт только посты старше start_cmid
+        self._clock = 0
         self.lp_updates: asyncio.Queue = asyncio.Queue()
         self.lp_requests: list[str] = []
         self.lp_ts = 100
@@ -61,7 +72,24 @@ class FakeVK:
             **extra,
         }
         messages.append(msg)
+        self._touch(peer_id)
+        if not out:
+            self.unread[peer_id] = self.unread.get(peer_id, 0) + 1
         return msg
+
+    def _touch(self, peer_id: int) -> None:
+        self._clock += 1
+        self.activity[peer_id] = self._clock
+
+    def add_channel(self, channel_id: int = CHANNEL_ID, title: str = "Новости канала") -> None:
+        self.channels[channel_id] = {"title": title, "posts": []}
+
+    def add_post(self, text: str, channel_id: int = CHANNEL_ID, **extra) -> dict:
+        posts = self.channels[channel_id]["posts"]
+        # формат поста канала: cmid / author_id / time вместо id / from_id / date
+        post = {"cmid": len(posts) + 1, "author_id": channel_id, "time": int(time.time()), "text": text, **extra}
+        posts.append(post)
+        return post
 
     def push_event(self, update: list) -> None:
         self.lp_updates.put_nowait(update)
@@ -92,7 +120,8 @@ class FakeVK:
         handler = getattr(self, "m_" + name.replace(".", "_"), None)
         if handler is None or name in self.disabled:
             return _error(3, "Unknown method passed")
-        return web.json_response({"response": handler(form)})
+        result = handler(form)
+        return result if isinstance(result, web.Response) else web.json_response({"response": result})
 
     async def handle_lp(self, request: web.Request) -> web.Response:
         self.lp_requests.append(request.method)
@@ -123,12 +152,17 @@ class FakeVK:
     # --- методы API ---
 
     def _conversation(self, peer_id: int) -> dict:
+        vk_type = "chat" if peer_id >= 2_000_000_000 else "user" if peer_id > 0 else "group"
         conv = {
-            "peer": {"id": peer_id, "type": "chat" if peer_id >= 2_000_000_000 else "user"},
+            "peer": {"id": peer_id, "type": vk_type},
             "last_conversation_message_id": len(self.history.get(peer_id, [])),
+            "unread_count": self.unread.get(peer_id, 0),
         }
-        if peer_id in self.titles:
-            conv["chat_settings"] = {"title": self.titles[peer_id]}
+        if vk_type == "chat":
+            conv["chat_settings"] = {
+                "title": self.titles.get(peer_id, f"Беседа {peer_id}"),
+                "is_group_channel": peer_id in self.old_channels,
+            }
         return conv
 
     def _extended(self) -> dict:
@@ -136,8 +170,9 @@ class FakeVK:
             "profiles": [
                 {"id": 1, "first_name": "Я", "last_name": "Сам"},
                 {"id": USER, "first_name": "Анна", "last_name": "Смирнова"},
+                {"id": 43, "first_name": "Борис", "last_name": "Новиков"},
             ],
-            "groups": [{"id": 7, "name": "Паблик"}],
+            "groups": [{"id": -SHOP, "name": "Магазин «Всё по 100»"}],
         }
 
     def m_users_get(self, form) -> list:
@@ -149,24 +184,23 @@ class FakeVK:
     def m_messages_getLongPollServer(self, form) -> dict:
         return {"key": "k", "ts": self.lp_ts, "server": f"{self.base}/lp"}
 
-    def m_messages_getConversations(self, form) -> dict:
-        peers = sorted(self.history)
+    def m_messages_getConversations(self, form) -> dict | web.Response:
+        if form.get("filter") in self.refused_filters:
+            return _error(100, "One of the parameters specified was missing or invalid: filter")
+        in_requests = form.get("filter") == "message_request"
+        peers = [p for p in self.history if (p in self.requests) == in_requests]
+        peers.sort(key=lambda p: -self.activity.get(p, 0))
         offset, count = int(form.get("offset", 0)), int(form.get("count", 20))
-        items = [{"conversation": self._conversation(p)} for p in peers[offset : offset + count]]
+        items = [
+            {"conversation": self._conversation(p), "last_message": (self.history[p] or [{}])[-1]}
+            for p in peers[offset : offset + count]
+        ]
         return {"count": len(peers), "items": items, **self._extended()}
 
-    def m_messages_searchConversations(self, form) -> dict:
-        query = str(form.get("q", "")).lower()
-        found = [p for p in sorted(self.history) if query in self.titles.get(p, "анна смирнова").lower()]
-        return {"count": len(found), "items": [self._conversation(p) for p in found], **self._extended()}
-
-    def m_messages_getConversationsById(self, form) -> dict:
-        peers = [int(p) for p in str(form["peer_ids"]).split(",")]
-        items = [self._conversation(p) for p in peers if p in self.history]
-        return {"count": len(items), "items": items, **self._extended()}
-
-    def m_messages_getHistory(self, form) -> dict:
+    def m_messages_getHistory(self, form) -> dict | web.Response:
         peer_id, count = int(form["peer_id"]), int(form.get("count", 20))
+        if peer_id in self.history_errors:
+            return _error(self.history_errors[peer_id], "You don't have access to this chat")
         messages = self.history.get(peer_id, [])
         return {
             "count": len(messages),
@@ -174,6 +208,25 @@ class FakeVK:
             "conversations": [self._conversation(peer_id)],
             **self._extended(),
         }
+
+    def _channel_item(self, channel_id: int) -> dict:
+        channel = self.channels[channel_id]
+        item = {"channel": {"channel_id": channel_id, "title": channel["title"]}}
+        if channel["posts"]:
+            item["last_message"] = channel["posts"][-1]
+        return item
+
+    def m_channels_get(self, form) -> dict:
+        return {"count": len(self.channels), "items": [self._channel_item(c) for c in self.channels]}
+
+    def m_channels_getById(self, form) -> dict:
+        return {"items": [self._channel_item(int(c)) for c in str(form["channel_ids"]).split(",")]}
+
+    def m_channels_getHistory(self, form) -> dict:
+        posts = self.channels[int(form["channel_id"])]["posts"]
+        start, count = int(form["start_cmid"]), int(form.get("count", 20))
+        older = [p for p in posts if p["cmid"] < start or (p["cmid"] == start and not self.history_skips_start)]
+        return {"items": list(reversed(older))[:count], "groups": []}
 
 
 def _error(code: int, message: str) -> web.Response:
@@ -185,6 +238,7 @@ class FakeSink:
         self.sent: list[Rendered] = []
         self.urls: list[str | None] = []
         self.notices: list[str] = []
+        self.asked: list[int] = []  # peer_id чатов, про которые спросили владельца
         self.fail_next: Exception | None = None
 
     async def send(self, rendered: Rendered, url: str | None = None) -> None:
@@ -196,6 +250,14 @@ class FakeSink:
 
     async def notice(self, text: str) -> None:
         self.notices.append(text)
+
+    async def ask(self, chat) -> None:
+        self.asked.append(chat.peer_id)
+
+    @property
+    def bodies(self) -> list[str]:
+        """Последние строки пересланных сообщений — сам текст без шапки."""
+        return [r.text.split("\n")[-1] for r in self.sent]
 
     @property
     def texts(self) -> list[str]:

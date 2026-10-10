@@ -83,6 +83,7 @@ async def check(cfg: Config) -> None:
                 print(f"[ok] ВК: long poll подключается (режим {lp.mode})")
             except LongPollUnavailable as e:
                 print(f"[!!] ВК: long poll недоступен, бот будет работать опросом. Причина: {e}")
+            await _check_extras(vk)
         except VKAuthError as e:
             print(f"[!!] ВК не подключён: {e.message}. Выполните: python -m vkstream login")
         except VKError as e:
@@ -101,6 +102,38 @@ async def check(cfg: Config) -> None:
         print(f"[!!] Telegram: {e}")
     finally:
         await bot.session.close()
+
+
+async def _check_extras(vk) -> None:
+    """Списки, которые ВК отдаёт отдельными (частью недокументированными) методами."""
+    from .vk.channels import channel_history, list_channels
+    from .vk.client import VKAuthError, VKError
+    from .vk.peers import Names, list_conversations
+
+    names = Names()
+    try:
+        _, total = await list_conversations(vk, names, 0, 1, filter="message_request")
+        print(f"[ok] ВК: папка «Запросы» читается, диалогов: {total}")
+    except VKAuthError:
+        raise
+    except VKError as e:
+        print(f"[!!] ВК: папка «Запросы» недоступна (сообщения не от друзей могут не приходить): {e}")
+    try:
+        channels = await list_channels(vk, names)
+        print(f"[ok] ВК: список каналов читается, каналов: {len(channels)}")
+        with_posts = next((c for c in channels if c.last_cmid), None)
+        if with_posts is not None:
+            posts = await channel_history(vk, names, with_posts.peer_id, with_posts.last_cmid, 5)
+            newest = max((p["conversation_message_id"] for p in posts), default=None)
+            verdict = "ok" if newest == with_posts.last_cmid else "!!"
+            print(
+                f"[{verdict}] ВК: посты канала читаются: получено {len(posts)}, "
+                f"самый свежий №{newest}, ожидался №{with_posts.last_cmid}"
+            )
+    except VKAuthError:
+        raise
+    except VKError as e:
+        print(f"[!!] ВК: каналы недоступны: {e}")
 
 
 def main() -> None:

@@ -18,7 +18,7 @@ from aiogram.methods import (
 from vkstream import sender as sender_module
 from vkstream.render import Media, Rendered
 from vkstream.sender import TelegramSink, TransientSendError
-from vkstream.state import State
+from vkstream.state import CHANNEL, GROUP, Chat, State
 from vkstream.vk.client import Downloaded
 
 from .conftest import make_bot
@@ -167,3 +167,25 @@ async def test_network_errors_are_retried_then_reported_as_transient(tmp_path):
     session.errors += [error(TelegramNetworkError, "timeout")] * 5
     with pytest.raises(TransientSendError):
         await sink.send(Rendered("не дойдёт"))
+
+
+async def test_question_about_new_group_or_channel(tmp_path):
+    sink, session = make_sink(tmp_path)
+    await sink.ask(Chat(2_000_000_001, "Чат <двора>", GROUP))
+    await sink.ask(Chat(-500, "Новости", CHANNEL, api="channels"))
+    group, channel = session.of(SendMessage)
+    assert group.text.startswith("❓ 👥 <b>Чат &lt;двора&gt;</b>\nПересылать сюда сообщения из этой группы?")
+    assert "из этого канала" in channel.text
+    assert [(b.text, b.callback_data) for b in channel.reply_markup.inline_keyboard[0]] == [
+        ("✅ Оставить", "d:-500:allow"),
+        ("🚫 Заблокировать", "d:-500:block"),
+    ]
+
+
+async def test_question_rejected_by_telegram_does_not_raise(tmp_path):
+    sink, session = make_sink(tmp_path)
+    session.errors.append(error(TelegramBadRequest, "chat not found"))
+    await sink.ask(Chat(2_000_000_001, "Чат", GROUP))  # иначе первое сообщение пересылалось бы по кругу
+    session.errors += [error(TelegramNetworkError, "timeout")] * 5
+    with pytest.raises(TransientSendError):
+        await sink.ask(Chat(2_000_000_001, "Чат", GROUP))

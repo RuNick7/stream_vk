@@ -18,7 +18,7 @@ def names() -> Names:
     return n
 
 
-def render(msg: dict, kind: str = "chat", title: str = "Чат") -> "Rendered":
+def render(msg: dict, kind: str = "group", title: str = "Чат") -> "Rendered":
     msg.setdefault("date", int(time.time()))
     return render_message(msg, title=title, kind=kind, names=names())
 
@@ -26,7 +26,7 @@ def render(msg: dict, kind: str = "chat", title: str = "Чат") -> "Rendered":
 def test_chat_message_shows_title_author_and_escapes_html():
     r = render({"from_id": 1, "text": "2 < 3 & <b>жирный</b>"}, title="Отдел <R&D>")
     assert r.text == (
-        "💬 <b>Отдел &lt;R&amp;D&gt;</b>\n"
+        "👥 <b>Отдел &lt;R&amp;D&gt;</b>\n"
         "👤 <b>Анна Смирнова</b>\n"
         "2 &lt; 3 &amp; &lt;b&gt;жирный&lt;/b&gt;"
     )
@@ -34,12 +34,12 @@ def test_chat_message_shows_title_author_and_escapes_html():
 
 
 def test_private_dialog_has_no_separate_author_line():
-    r = render({"from_id": 1, "text": "привет"}, kind="user", title="Анна Смирнова")
+    r = render({"from_id": 1, "text": "привет"}, kind="personal", title="Анна Смирнова")
     assert r.text == "👤 <b>Анна Смирнова</b>\nпривет"
 
 
 def test_outgoing_and_community_author():
-    assert "👤 <b>Вы</b>" in render({"from_id": 9, "out": 1, "text": "ок"}, kind="user").text
+    assert "👤 <b>Вы</b>" in render({"from_id": 9, "out": 1, "text": "ок"}, kind="personal").text
     assert "👤 <b>Новости &lt;города&gt;</b>" in render({"from_id": -5, "text": "пост"}).text
 
 
@@ -149,3 +149,8 @@ def test_old_message_is_stamped_with_its_time_and_empty_gets_placeholder():
 def test_strip_tags_and_message_url():
     assert strip_tags('<b>A &amp; B</b> <a href="https://x">ссылка</a>') == "A & B ссылка"
     assert message_url("https://vk.ru", 2_000_000_001, 15) == "https://vk.ru/im/convo/2000000001?cmid=15"
+
+
+def test_channel_and_business_posts_have_no_author_line():
+    assert render({"from_id": -5, "text": "пост"}, kind="channel", title="Канал").text == "📣 <b>Канал</b>\nпост"
+    assert render({"from_id": -5, "text": "акция"}, kind="business", title="Магазин").text == "🏢 <b>Магазин</b>\nакция"

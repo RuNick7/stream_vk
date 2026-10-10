@@ -7,6 +7,7 @@ import re
 import time
 from dataclasses import dataclass, field
 
+from .state import BUSINESS, CHANNEL, GROUP, PERSONAL
 from .vk.peers import Names
 
 MAX_UPLOAD_BYTES = 49 * 1024 * 1024  # лимит Bot API на отправку файла — 50 МБ
@@ -14,7 +15,7 @@ MAX_FWD_DEPTH = 3
 MAX_FWD_COUNT = 20
 QUOTE_PREFIX = "┃ "
 
-KIND_ICONS = {"user": "👤", "chat": "💬", "group": "📢", "email": "✉️"}
+KIND_ICONS = {PERSONAL: "👤", GROUP: "👥", CHANNEL: "📣", BUSINESS: "🏢"}
 
 ATTACHMENT_LABELS = {
     "gift": "🎁 Подарок",
@@ -94,7 +95,7 @@ def render_message(
     lines = [head]
     if msg.get("out"):
         lines.append("👤 <b>Вы</b>")
-    elif kind == "chat":
+    elif kind == GROUP:
         lines.append(f"👤 <b>{esc(names.get(msg.get('from_id')))}</b>")
     body = _body(msg, names, media, depth=0)
     if not body and not media:

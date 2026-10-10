@@ -1,14 +1,11 @@
-"""Интерфейс бота: выбор чатов ВК, список пересылаемых, статус."""
+"""Интерфейс бота: настройки пересылки по категориям и чатам, поиск, статус."""
 
 from __future__ import annotations
 
-import asyncio
-import functools
 import secrets
 import time
 from dataclasses import dataclass, field
 
-import aiohttp
 from aiogram import F, Router
 from aiogram.enums import ChatType
 from aiogram.exceptions import TelegramBadRequest
@@ -23,30 +20,46 @@ from aiogram.types import (
 )
 
 from .config import Config
-from .forwarder import LOGIN_HINT, Forwarder
-from .render import esc
-from .state import State, Watch
-from .vk.client import VKAuthError, VKClient, VKError
-from .vk.peers import PeerInfo, list_conversations, search_conversations
+from .forwarder import CHANNELS, CONVERSATIONS, LOGIN_HINT, REQUESTS, Forwarder
+from .render import KIND_ICONS, esc
+from .state import ALLOW, BLOCK, BUSINESS, CHANNEL, GROUP, PERSONAL, Chat, State
+from .vk.client import VKClient
 
 PAGE_SIZE = 8
 SEARCH_LIMIT = 10
 TITLE_LIMIT = 40
-ICONS = {"user": "👤", "chat": "👥", "group": "📢", "email": "✉️"}
+
+KIND_NAMES = {PERSONAL: "Личные", GROUP: "Группы", CHANNEL: "Каналы", BUSINESS: "Бизнес и реклама"}
+KIND_RULES = {
+    PERSONAL: "пересылаются все",
+    GROUP: "по выбору",
+    CHANNEL: "по выбору",
+    BUSINESS: "не пересылаются",
+}
+KIND_LEGEND = {
+    PERSONAL: "✅ пересылается · 🚫 заблокирован",
+    GROUP: "✅ пересылается · 🚫 заблокирована · ❓ спрошу при первом сообщении",
+    CHANNEL: "✅ пересылается · 🚫 заблокирован · ❓ спрошу при первом посте",
+    BUSINESS: "✅ пересылается · 🚫 не пересылается",
+}
+# Порядок разделов на экране настроек
+KIND_ORDER = (GROUP, CHANNEL, PERSONAL, BUSINESS)
 
 COMMANDS = [
-    BotCommand(command="chats", description="Выбрать чаты ВК для пересылки"),
-    BotCommand(command="find", description="Найти чат ВК по названию"),
-    BotCommand(command="list", description="Что сейчас пересылается"),
+    BotCommand(command="settings", description="Что пересылать: разделы и чаты"),
+    BotCommand(command="find", description="Найти чат по названию"),
     BotCommand(command="status", description="Состояние подключения к ВК"),
     BotCommand(command="help", description="Справка"),
 ]
 
 HELP = (
-    "Я пересылаю сюда новые сообщения из выбранных чатов ВКонтакте.\n\n"
-    "/chats — выбрать чаты из списка диалогов\n"
+    "Я пересылаю сюда новые сообщения из ВКонтакте:\n\n"
+    "👤 <b>личные</b> — все, автоматически;\n"
+    "👥 <b>группы</b> и 📣 <b>каналы</b> — по вашему выбору: при первом сообщении "
+    "спрошу, оставить или заблокировать;\n"
+    "🏢 <b>бизнес и реклама</b> (диалоги с сообществами) — не пересылаю.\n\n"
+    "/settings — изменить выбор для любого чата\n"
     "/find <i>текст</i> — найти чат по названию (или просто напишите название)\n"
-    "/list — что пересылается сейчас\n"
     "/status — состояние подключения к ВК"
 )
 
@@ -68,134 +81,142 @@ class IsOwner(BaseFilter):
         return user is not None and app.state.owner_id == user.id
 
 
-def vk_guard(handler):
-    """Показать пользователю ошибку ВК вместо молчаливого падения хендлера."""
+# --- оформление ---------------------------------------------------------------
 
-    @functools.wraps(handler)
-    async def wrapper(event: Message | CallbackQuery, *args, **kwargs):
-        try:
-            return await handler(event, *args, **kwargs)
-        except VKAuthError as e:
-            alert = "ВК не подключён. Подробности: /status"
-            text = f"⚠️ ВК не подключён: {esc(e.message)}.\n{LOGIN_HINT}"
-        except VKError as e:
-            alert = f"Ошибка VK API: {e}"
-            text = "⚠️ " + esc(alert)
-        except (aiohttp.ClientError, asyncio.TimeoutError):
-            alert = "Нет связи с ВК, попробуйте ещё раз."
-            text = "⚠️ " + alert
-        if isinstance(event, CallbackQuery):
-            await event.answer(alert[:200], show_alert=True)
+
+def status_icon(chat: Chat) -> str:
+    return {ALLOW: "✅", BLOCK: "🚫"}.get(chat.policy, "❓")
+
+
+def _clip(title: str) -> str:
+    return title if len(title) <= TITLE_LIMIT else title[: TITLE_LIMIT - 1] + "…"
+
+
+def _counts(app: App, kind: str) -> tuple[int, int, int]:
+    """Сколько чатов категории: пересылается, заблокировано, ещё без решения."""
+    allow = block = ask = 0
+    for chat in app.state.chats.values():
+        if chat.kind != kind:
+            continue
+        if chat.policy == ALLOW:
+            allow += 1
+        elif chat.policy == BLOCK:
+            block += 1
         else:
-            await event.answer(text)
-
-    return wrapper
-
-
-# --- клавиатуры ---------------------------------------------------------------
+            ask += 1
+    return allow, block, ask
 
 
-def _button_title(title: str, kind: str, watched: bool) -> str:
-    title = title if len(title) <= TITLE_LIMIT else title[: TITLE_LIMIT - 1] + "…"
-    return f"{'✅ ' if watched else ''}{ICONS.get(kind, '💬')} {title}"
+def _summary(app: App, kind: str) -> str:
+    allow, block, ask = _counts(app, kind)
+    if kind == PERSONAL:
+        return f"всего {allow + block}" + (f", заблокировано {block}" if block else "")
+    if kind == BUSINESS:
+        return f"всего {allow + block}" + (f", разрешено {allow}" if allow else "")
+    return f"✅ {allow} · 🚫 {block} · ❓ {ask}"
 
 
-def chats_keyboard(
-    items: list[PeerInfo], watched: set[int], page: int, pages: int
-) -> InlineKeyboardMarkup:
-    rows = [
-        [
-            InlineKeyboardButton(
-                text=_button_title(p.title, p.kind, p.peer_id in watched),
-                callback_data=f"w:{p.peer_id}:{page}",
-            )
-        ]
-        for p in items
-    ]
-    nav = []
-    if page > 0:
-        nav.append(InlineKeyboardButton(text="◀️", callback_data=f"p:{page - 1}"))
-    nav.append(InlineKeyboardButton(text=f"🔄 {page + 1}/{pages}", callback_data=f"p:{page}"))
-    if page < pages - 1:
-        nav.append(InlineKeyboardButton(text="▶️", callback_data=f"p:{page + 1}"))
-    rows.append(nav)
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+def _decision_text(chat: Chat) -> str:
+    verb = "пересылается" if chat.policy == ALLOW else "не пересылается"
+    return f"{status_icon(chat)} {KIND_ICONS.get(chat.kind, '')} <b>{esc(chat.title)}</b> — {verb}."
 
 
-def search_keyboard(items: list[PeerInfo], watched: set[int]) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text=_button_title(p.title, p.kind, p.peer_id in watched),
-                    callback_data=f"s:{p.peer_id}",
-                )
-            ]
-            for p in items
-        ]
-    )
-
-
-def watches_keyboard(watches: list[Watch]) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="❌ " + _button_title(w.title, w.kind, False),
-                    callback_data=f"r:{w.peer_id}",
-                )
-            ]
-            for w in watches
-        ]
-    )
+def _toast(chat: Chat) -> str:
+    return ("Пересылается: " if chat.policy == ALLOW else "Заблокировано: ") + chat.title
 
 
 # --- экраны -------------------------------------------------------------------
 
 
-async def chats_screen(app: App, page: int) -> tuple[str, InlineKeyboardMarkup]:
-    items, total = await list_conversations(app.vk, app.forwarder.names, page * PAGE_SIZE, PAGE_SIZE)
-    pages = max(1, -(-total // PAGE_SIZE))
-    if not items and page > 0:  # список стал короче, пока листали
-        return await chats_screen(app, pages - 1)
-    text = (
-        "Выберите чаты ВК — новые сообщения из них будут приходить сюда.\n"
-        f"✅ — уже пересылается. Всего диалогов: {total}."
-    )
-    return text, chats_keyboard(items, set(app.state.watches), page, pages)
+def settings_screen(app: App) -> tuple[str, InlineKeyboardMarkup | None]:
+    if CONVERSATIONS not in app.state.baselined:
+        return "Список чатов ВК ещё не прочитан. Что происходит — в /status", None
+    lines = ["⚙️ <b>Что пересылать</b>", ""]
+    for kind in (PERSONAL, GROUP, CHANNEL, BUSINESS):
+        lines.append(f"{KIND_ICONS[kind]} <b>{KIND_NAMES[kind]}</b> — {KIND_RULES[kind]}")
+        lines.append(f"      {_summary(app, kind)}")
+    lines += ["", "Откройте раздел, чтобы изменить выбор для конкретного чата."]
+    buttons = [
+        InlineKeyboardButton(text=f"{KIND_ICONS[kind]} {KIND_NAMES[kind]}", callback_data=f"c:{kind}:0")
+        for kind in KIND_ORDER
+    ]
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=[buttons[:2], buttons[2:]])
 
 
-async def search_screen(app: App, query: str) -> tuple[str, InlineKeyboardMarkup | None]:
-    items = await search_conversations(app.vk, app.forwarder.names, query, SEARCH_LIMIT)
-    if not items:
+def category_screen(app: App, kind: str, page: int) -> tuple[str, InlineKeyboardMarkup]:
+    chats = app.state.of_kind(kind)
+    pages = max(1, -(-len(chats) // PAGE_SIZE))
+    page = min(max(page, 0), pages - 1)
+    rows = [
+        [
+            InlineKeyboardButton(
+                text=f"{status_icon(chat)} {_clip(chat.title)}", callback_data=f"t:{chat.peer_id}:{page}"
+            )
+        ]
+        for chat in chats[page * PAGE_SIZE : (page + 1) * PAGE_SIZE]
+    ]
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="◀️", callback_data=f"c:{kind}:{page - 1}"))
+    nav.append(InlineKeyboardButton(text=f"{page + 1}/{pages}", callback_data=f"c:{kind}:{page}"))
+    if page < pages - 1:
+        nav.append(InlineKeyboardButton(text="▶️", callback_data=f"c:{kind}:{page + 1}"))
+    rows.append(nav)
+    rows.append([InlineKeyboardButton(text="« Разделы", callback_data="m")])
+    text = f"{KIND_ICONS[kind]} <b>{KIND_NAMES[kind]}</b> — {KIND_RULES[kind]}\n"
+    if chats:
+        text += f"{KIND_LEGEND[kind]}\nНажмите на чат, чтобы переключить."
+    elif kind == CHANNEL and app.forwarder.feature_errors[CHANNELS]:
+        text += f"⚠️ ВК не отдал список каналов: {esc(app.forwarder.feature_errors[CHANNELS])}"
+    else:
+        text += "Здесь пока пусто."
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def search_screen(app: App, query: str) -> tuple[str, InlineKeyboardMarkup | None]:
+    needle = query.casefold()
+    found = [c for c in app.state.chats.values() if needle in c.title.casefold()]
+    found.sort(key=lambda c: (-c.last_date, c.title.casefold()))
+    if not found:
         return f"По запросу «{esc(query)}» чатов не найдено.", None
-    return f"Найдено по запросу «{esc(query)}»:", search_keyboard(items, set(app.state.watches))
-
-
-def list_screen(app: App) -> tuple[str, InlineKeyboardMarkup | None]:
-    watches = list(app.state.watches.values())
-    if not watches:
-        return "Пока ничего не пересылается. Выберите чаты: /chats", None
-    return f"Пересылается чатов: {len(watches)}. Нажмите, чтобы убрать.", watches_keyboard(watches)
+    rows = [
+        [
+            InlineKeyboardButton(
+                text=f"{status_icon(chat)} {KIND_ICONS.get(chat.kind, '')} {_clip(chat.title)}",
+                callback_data=f"f:{chat.peer_id}",
+            )
+        ]
+        for chat in found[:SEARCH_LIMIT]
+    ]
+    more = f" (показаны первые {SEARCH_LIMIT} из {len(found)})" if len(found) > SEARCH_LIMIT else ""
+    text = f"Найдено по запросу «{esc(query)}»{more}. Нажмите на чат, чтобы переключить пересылку."
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def status_text(app: App) -> str:
     fwd = app.forwarder
-    if fwd.auth_ok:
-        vk = f"✅ ВК: {esc(app.vk.me_name)}"
-    elif fwd.auth_ok is None:
-        vk = "⏳ ВК: подключаюсь…"
+    if fwd.auth_ok is None:
+        return "⏳ ВК: подключаюсь…"
+    if not fwd.auth_ok:
+        return f"⚠️ ВК не подключён: {esc(fwd.auth_error)}.\n{LOGIN_HINT}"
+    lines = [f"✅ ВК: {esc(app.vk.me_name)}"]
+    if CONVERSATIONS not in app.state.baselined:
+        lines.append("⏳ Читаю список чатов…")
+        return "\n".join(lines)
+    if fwd.lp_mode:
+        lines.append(f"📡 Новые сообщения: мгновенно (long poll, режим {fwd.lp_mode})")
     else:
-        vk = f"⚠️ ВК не подключён: {esc(fwd.auth_error)}.\n{LOGIN_HINT}"
-    lines = [vk]
-    if fwd.auth_ok:
-        if not app.state.watches:
-            lines.append("📡 Жду, пока вы выберете чаты: /chats")
-        elif fwd.lp_mode:
-            lines.append(f"📡 Новые сообщения: мгновенно (long poll, режим {fwd.lp_mode})")
-        else:
-            lines.append(f"📡 Новые сообщения: опрос раз в {app.cfg.fallback_poll_interval:g} с")
-    lines.append(f"💬 Чатов пересылается: {len(app.state.watches)}")
+        lines.append(f"📡 Новые сообщения: опрос раз в {app.cfg.fallback_poll_interval:g} с")
+    for kind in (PERSONAL, GROUP, CHANNEL, BUSINESS):
+        lines.append(f"{KIND_ICONS[kind]} {KIND_NAMES[kind]}: {_summary(app, kind)}")
+    if fwd.feature_errors[CHANNELS]:
+        lines.append(f"⚠️ Каналы недоступны: {esc(fwd.feature_errors[CHANNELS])}")
+    if fwd.feature_errors[REQUESTS]:
+        lines.append(f"⚠️ Запросы на переписку недоступны: {esc(fwd.feature_errors[REQUESTS])}")
+    for api, error in fwd.read_errors.items():
+        if error:
+            what = "постов каналов" if api == CHANNELS else "сообщений"
+            lines.append(f"⚠️ Последняя ошибка чтения {what}: {esc(error)}")
     lines.append(f"📨 Переслано с запуска: {fwd.forwarded}")
     if fwd.last_forward_at:
         lines.append("🕒 Последнее: " + time.strftime("%d.%m %H:%M:%S", time.localtime(fwd.last_forward_at)))
@@ -210,14 +231,6 @@ async def _edit(message: Message | None, text: str, markup: InlineKeyboardMarkup
     except TelegramBadRequest as e:
         if "not modified" not in str(e):
             raise
-
-
-async def _toggle(app: App, peer_id: int) -> str:
-    removed = app.forwarder.remove_watch(peer_id)
-    if removed is not None:
-        return f"Больше не пересылается: {removed.title}"
-    watch = await app.forwarder.add_watch(peer_id)
-    return f"Пересылается: {watch.title}"
 
 
 # --- хендлеры -----------------------------------------------------------------
@@ -248,18 +261,11 @@ async def cmd_status(message: Message, app: App) -> None:
     await message.answer(status_text(app))
 
 
-@vk_guard
-async def cmd_chats(message: Message, app: App) -> None:
-    text, markup = await chats_screen(app, 0)
+async def cmd_settings(message: Message, app: App) -> None:
+    text, markup = settings_screen(app)
     await message.answer(text, reply_markup=markup)
 
 
-async def cmd_list(message: Message, app: App) -> None:
-    text, markup = list_screen(app)
-    await message.answer(text, reply_markup=markup)
-
-
-@vk_guard
 async def cmd_find(message: Message, command: CommandObject, app: App) -> None:
     query = (command.args or "").strip()
     if not query:
@@ -268,47 +274,65 @@ async def cmd_find(message: Message, command: CommandObject, app: App) -> None:
     await _search(message, app, query)
 
 
-@vk_guard
 async def on_text(message: Message, app: App) -> None:
     await _search(message, app, (message.text or "").strip())
 
 
 async def _search(message: Message, app: App, query: str) -> None:
     app.last_query = query
-    text, markup = await search_screen(app, query)
+    text, markup = search_screen(app, query)
     await message.answer(text, reply_markup=markup)
 
 
-@vk_guard
-async def cb_page(callback: CallbackQuery, app: App) -> None:
-    text, markup = await chats_screen(app, int(callback.data.split(":")[1]))
+async def cb_main(callback: CallbackQuery, app: App) -> None:
+    text, markup = settings_screen(app)
     await _edit(callback.message, text, markup)
     await callback.answer()
 
 
-@vk_guard
+async def cb_category(callback: CallbackQuery, app: App) -> None:
+    _, kind, page = callback.data.split(":")
+    if kind not in KIND_NAMES:
+        await callback.answer()
+        return
+    text, markup = category_screen(app, kind, int(page))
+    await _edit(callback.message, text, markup)
+    await callback.answer()
+
+
 async def cb_toggle(callback: CallbackQuery, app: App) -> None:
+    """Переключить чат в списке раздела."""
     _, peer_id, page = callback.data.split(":")
-    toast = await _toggle(app, int(peer_id))
-    text, markup = await chats_screen(app, int(page))
+    chat = app.forwarder.toggle(int(peer_id))
+    if chat is None:
+        await callback.answer("Чат не найден")
+        return
+    text, markup = category_screen(app, chat.kind, int(page))
     await _edit(callback.message, text, markup)
-    await callback.answer(toast)
+    await callback.answer(_toast(chat))
 
 
-@vk_guard
-async def cb_search_toggle(callback: CallbackQuery, app: App) -> None:
-    toast = await _toggle(app, int(callback.data.split(":")[1]))
+async def cb_found_toggle(callback: CallbackQuery, app: App) -> None:
+    """Переключить чат в результатах поиска."""
+    chat = app.forwarder.toggle(int(callback.data.split(":")[1]))
+    if chat is None:
+        await callback.answer("Чат не найден")
+        return
     if app.last_query:
-        text, markup = await search_screen(app, app.last_query)
+        text, markup = search_screen(app, app.last_query)
         await _edit(callback.message, text, markup)
-    await callback.answer(toast)
+    await callback.answer(_toast(chat))
 
 
-async def cb_remove(callback: CallbackQuery, app: App) -> None:
-    removed = app.forwarder.remove_watch(int(callback.data.split(":")[1]))
-    text, markup = list_screen(app)
-    await _edit(callback.message, text, markup)
-    await callback.answer(f"Убрано: {removed.title}" if removed else "Уже убрано")
+async def cb_decide(callback: CallbackQuery, app: App) -> None:
+    """Ответ на вопрос «оставить или заблокировать?» под первым сообщением чата."""
+    _, peer_id, decision = callback.data.split(":")
+    chat = app.forwarder.decide(int(peer_id), ALLOW if decision == ALLOW else BLOCK)
+    if chat is None:
+        await callback.answer("Чат не найден")
+        return
+    await _edit(callback.message, _decision_text(chat) + "\nИзменить выбор: /settings", None)
+    await callback.answer(_toast(chat))
 
 
 def build_router() -> Router:
@@ -322,13 +346,13 @@ def build_router() -> Router:
     owner.callback_query.filter(IsOwner())
     owner.message.register(cmd_help, Command("help"))
     owner.message.register(cmd_status, Command("status"))
-    owner.message.register(cmd_chats, Command("chats"))
-    owner.message.register(cmd_list, Command("list"))
+    owner.message.register(cmd_settings, Command("settings"))
     owner.message.register(cmd_find, Command("find"))
     owner.message.register(on_text, F.text & ~F.text.startswith("/"))
-    owner.callback_query.register(cb_page, F.data.startswith("p:"))
-    owner.callback_query.register(cb_toggle, F.data.startswith("w:"))
-    owner.callback_query.register(cb_search_toggle, F.data.startswith("s:"))
-    owner.callback_query.register(cb_remove, F.data.startswith("r:"))
+    owner.callback_query.register(cb_main, F.data == "m")
+    owner.callback_query.register(cb_category, F.data.startswith("c:"))
+    owner.callback_query.register(cb_toggle, F.data.startswith("t:"))
+    owner.callback_query.register(cb_found_toggle, F.data.startswith("f:"))
+    owner.callback_query.register(cb_decide, F.data.startswith("d:"))
     router.include_router(owner)
     return router

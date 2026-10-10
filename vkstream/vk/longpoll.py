@@ -106,12 +106,17 @@ class LongPoll:
         return updates if isinstance(updates, list) else []
 
 
-def peers_in_update(update: Any, watched: Collection[int]) -> set[int]:
-    """Какие из отслеживаемых чатов упомянуты в событии long poll."""
+def is_noise(update: Any) -> bool:
+    """Событие, после которого новых сообщений точно нет (или вовсе не событие)."""
     if not isinstance(update, list) or not update:
-        return set()
+        return True
     code = update[0]
-    if isinstance(code, int) and code % 10000 in NOISE_CODES:
+    return isinstance(code, int) and code % 10000 in NOISE_CODES
+
+
+def peers_in_update(update: Any, known: Collection[int]) -> set[int]:
+    """Какие из известных чатов упомянуты в событии long poll."""
+    if is_noise(update):
         return set()
     found: set[int] = set()
     stack: list[Any] = list(update[1:])
@@ -120,7 +125,7 @@ def peers_in_update(update: Any, watched: Collection[int]) -> set[int]:
         if isinstance(item, bool):
             continue
         if isinstance(item, int):
-            if item in watched:
+            if item in known:
                 found.add(item)
         elif isinstance(item, list):
             stack.extend(item)
